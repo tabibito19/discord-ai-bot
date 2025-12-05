@@ -11,7 +11,7 @@ import dropbox
 import json
 import threading 
 import requests
-from flask import Flask
+from flask import Flask, jsonify # Flaskからjsonifyもインポート
 from waitress import serve # Flaskを本番環境で実行するための軽量サーバー
 
 # --------------------------------------------------------------------------------------
@@ -22,6 +22,9 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', 'YOUR_GEMINI_API_KEY')
 DROPBOX_ACCESS_TOKEN = os.environ.get('DROPBOX_ACCESS_TOKEN', 'YOUR_DROPBOX_ACCESS_TOKEN')
 DROPBOX_VAULT_ROOT = os.environ.get('DROPBOX_VAULT_ROOT', '/Obsidian Vault')
 
+# Renderが提供するポートを使用
+PORT = int(os.environ.get('PORT', 8080))
+
 # --------------------------------------------------------------------------------------
 # 設定
 # --------------------------------------------------------------------------------------
@@ -29,6 +32,9 @@ DROPBOX_VAULT_ROOT = os.environ.get('DROPBOX_VAULT_ROOT', '/Obsidian Vault')
 intents = discord.Intents.default()
 intents.message_content = True 
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Flask Web Serviceの設定
+app = Flask(__name__)
 
 # Gemini API の設定
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
@@ -38,7 +44,26 @@ GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMI
 DBX_TIMEOUT = 10 
 
 # --------------------------------------------------------------------------------------
+# Web Service (Flask) の定義
+# --------------------------------------------------------------------------------------
+
+@app.route('/', methods=['GET'])
+def home():
+    """Renderのヘルスチェック用エンドポイント"""
+    return jsonify({"status": "ok", "service": "Obsidian AI Bot Backend", "discord_status": "running"})
+
+def run_web_server():
+    """Waitressを使用してFlaskアプリを起動し、Renderのヘルスチェックに応答する"""
+    print(f"Starting Waitress server on port {PORT}...")
+    try:
+        # RenderのPORT環境変数を使ってバインド
+        serve(app, host='0.0.0.0', port=PORT)
+    except Exception as e:
+        print(f"Flask/Waitress server failed to start: {e}")
+
+# --------------------------------------------------------------------------------------
 # Dropbox 連携関数
+# [変更なし]
 # --------------------------------------------------------------------------------------
 
 def _save_note_to_obsidian(file_path, content):
@@ -104,6 +129,7 @@ def _save_note_to_obsidian(file_path, content):
 
 # --------------------------------------------------------------------------------------
 # Gemini API 連携関数
+# [変更なし]
 # --------------------------------------------------------------------------------------
 
 async def _call_gemini_api(prompt, content):
@@ -173,6 +199,7 @@ async def _call_gemini_api(prompt, content):
 
 # --------------------------------------------------------------------------------------
 # Discord Bot イベントとコマンド
+# [変更なし]
 # --------------------------------------------------------------------------------------
 
 @bot.event
@@ -253,4 +280,72 @@ async def on_message(message):
             f"**AI要約のプレビュー**\n"
             f"推定タイトル: `{suggested_title}` (フォルダ: `{suggested_folder}`)\n\n"
             f"--- AI提案内容 (500文字まで) ---\n"
-            f"
+            f"```markdown\n{suggested_text}\n```\n" # Markdown形式で表示
+            f"\n\n**この内容をObsidian Vaultに保存しますか？**\n"
+            f"✅: 保存（既存ノートがあれば追記） / ❌: キャンセル"
+        )
+        
+        await preview_message.add_reaction('✅')
+        await preview_message.add_reaction('❌')
+
+        def check(reaction, user):
+            return user == message.author and str(reaction.emoji) in ['✅', '❌'] and reaction.message.id == preview_message.id
+
+        try:
+            reaction, user = await bot.wait_for('reaction_add', timeout=60.0, check=check)
+
+            if str(reaction.emoji) == '✅':
+                # 保存実行
+                success, save_message = await asyncio.to_thread(
+                    _save_note_to_obsidian, final_file_path, note_content
+                )
+                
+                if success:
+                    action_type = "新規保存" if "新規保存" in save_message else "追記"
+                    final_reply = (
+                        f"✅ ノートをObsidian Vaultに**{action_type}**しました。\n"
+                        f"**タイトル:** `{suggested_title}`\n"
+                        f"**保存先:** `{final_file_path}`"
+                    )
+                else:
+                    final_reply = f"❌ ファイル保存に失敗しました。\n\n詳細: {save_message}"
+                
+                await preview_message.edit(content=final_reply)
+                await preview_message.clear_reactions()
+
+            else: # ❌でキャンセルされた場合
+                await preview_message.edit(content="❌ ノートの保存をキャンセルしました。")
+                await preview_message.clear_reactions()
+
+        except asyncio.TimeoutError:
+            await preview_message.edit(content="⚠️ 60秒間リアクションがなかったため、ノートの保存をキャンセルしました。")
+            await preview_message.clear_reactions()
+        except Exception as e:
+            print(f"Reaction/Save Error: {e}")
+            await preview_message.edit(content=f"🚨 予期せぬエラーが発生しました: {e}")
+            await preview_message.clear_reactions()
+            
+
+# --------------------------------------------------------------------------------------
+# Botの起動ロジック (メイン実行)
+# --------------------------------------------------------------------------------------
+
+# NOTE: RenderのWeb Serviceとして、Flaskサーバー起動とDiscord Bot起動を並行実行する
+
+if __name__ == '__main__':
+    if not DISCORD_TOKEN or not GEMINI_API_KEY or not DROPBOX_ACCESS_TOKEN:
+        print("--- 🚨 ERROR: 必要な環境変数が設定されていません。 ---")
+        print("DISCORD_TOKEN, GEMINI_API_KEY, DROPBOX_ACCESS_TOKEN の3つを設定してください。")
+    else:
+        # 1. Webサーバーを別スレッドで起動 (Renderのヘルスチェック用)
+        web_server_thread = threading.Thread(target=run_web_server)
+        web_server_thread.daemon = True 
+        web_server_thread.start()
+        
+        # 2. Discord Botをメインスレッドで起動
+        try:
+            bot.run(DISCORD_TOKEN)
+        except discord.LoginFailure:
+            print("--- 🚨 ERROR: DISCORD_TOKEN が不正です。 ---")
+        except Exception as e:
+            print(f"--- 🚨 ERROR: 予期せぬエラーが発生しました: {e} ---")
